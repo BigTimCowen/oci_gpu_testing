@@ -1,6 +1,6 @@
 **GPU Operational Testing** — Interactive tool for GPU operational testing, POC stack deployments, OKE node management, custom image operations, and instance metadata inspection on Oracle Cloud Infrastructure.
 
-**Version:** 1.0 | **Lines:** ~5,700
+**Version:** 1.0 | **Lines:** ~6,200
 
 ## Overview
 
@@ -17,6 +17,9 @@ Custom and platform image listing, image import from Object Storage, create imag
 
 **Metadata** (3 tools)
 Browse IMDS endpoints, dump all instance metadata, and auto-populate `variables.sh` from instance metadata
+
+**Compute Hosts** (multi-region scan)
+Scan all subscribed regions in parallel to discover compute hosts, view distribution summary, drill into region-level host listings with state/health/shape/topology, and inspect individual host details including impacted components
 
 **Built for daily ops:** metadata auto-discovery, response caching with configurable TTL, action logging, `--debug` mode, environment focus system (region/compartment/OKE cluster), and multi-auth support (instance principal, API key, Cloud Shell)
 
@@ -77,6 +80,7 @@ Global options available on any invocation:
   t)  OKE Testing       - Node creation, health checks, NCCL tests
   i)  Images            - Import, create, and manage custom images
   m)  Metadata          - Browse instance metadata service (IMDS)
+  h)  Compute Hosts     - Multi-region compute host scan & details
 
   env)   Change Focus    - Change region, compartment, OKE cluster
   q)     Quit
@@ -137,6 +141,20 @@ Actions: `#` (detail view), `gpu` (add GPU shape compatibility), `import` (impor
 
 ---
 
+### h) Compute Hosts
+
+| Option | Function | Description |
+|--------|----------|-------------|
+| `1` | Scan All Regions | Parallel scan of all subscribed regions for compute hosts |
+| `2` | View Region Hosts | Select a region to list hosts with state, health, shape, topology |
+| `r` | Refresh | Force rescan ignoring cache |
+
+**Host Detail View** (`#` drill-down): Name, state, health, shape, platform, AD/FD, instance ID, capacity reservation, HPC island/network block/local block topology, GPU memory fabric, impacted components, recycle status, timestamps.
+
+Scan results are cached for 10 minutes. Regions are queried in parallel (up to `OCI_MAX_PARALLEL` concurrent calls).
+
+---
+
 ## Environment Focus
 
 The environment focus system lets you scope operations without re-specifying targets:
@@ -165,6 +183,7 @@ All create/update/delete operations are:
 API responses are cached in `cache/` with configurable TTL:
 - OKE clusters and node pools: 5 minutes
 - Instance configurations: 10 minutes
+- Compute host region scan: 10 minutes
 - All other resources: 60 minutes (default)
 
 Use `r` at any menu to refresh cached data.

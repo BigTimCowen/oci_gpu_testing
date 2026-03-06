@@ -104,6 +104,7 @@ readonly INSTANCE_CONFIGS_CACHE="${CACHE_DIR}/instance_configs.json"
 readonly RM_STACKS_CACHE="${CACHE_DIR}/rm_stacks.json"
 readonly COMPARTMENTS_CACHE="${CACHE_DIR}/compartments.json"
 readonly IDENTITY_DOMAINS_CACHE="${CACHE_DIR}/identity_domains.json"
+readonly COMPUTE_HOST_SCAN_CACHE="${CACHE_DIR}/compute_host_scan.json"
 
 # Cache TTL (seconds)
 readonly CACHE_MAX_AGE=3600
@@ -5382,6 +5383,538 @@ EOF
 }
 
 #===============================================================================
+# MENU 5: COMPUTE HOSTS — Multi-Region Scan
+#===============================================================================
+
+# Fetch subscribed regions for the tenancy
+_ch_fetch_regions() {
+    local json
+    json=$(_oci_call "Subscribed Regions" \
+        oci iam region-subscription list \
+            --tenancy-id "${TENANCY_ID}" \
+            --all --output json 2>/dev/null)
+    echo "$json"
+}
+
+# Fetch compute hosts for a single region (called in parallel)
+# Accepts tenancy_id as $2 since this runs in backgrounded subshells
+_ch_fetch_region_hosts() {
+    local region="$1"
+    local tenancy_id="$2"
+    local json
+    json=$(oci compute compute-host list \
+        --compartment-id "$tenancy_id" \
+        --region "$region" \
+        --all --output json 2>/dev/null)
+    local count
+    count=$(jq '.data.items | length' <<< "$json" 2>/dev/null)
+    [[ -z "$count" || "$count" == "null" ]] && count=0
+    echo "$count"
+}
+
+# Scan all regions for compute hosts with progress bar
+# Writes results to COMPUTE_HOST_SCAN_CACHE and sets _CH_SCAN_RESULTS
+# UI output goes directly to terminal (not captured)
+_ch_scan_all_regions() {
+    local force="${1:-false}"
+    local scan_cache="$COMPUTE_HOST_SCAN_CACHE"
+
+    # Check cache unless forced
+    if [[ "$force" != "true" ]] && is_cache_fresh "$scan_cache" 600; then
+        echo -e "  ${GREEN}✓${NC} Using cached scan results"
+        _CH_SCAN_RESULTS=$(cat "$scan_cache")
+        return 0
+    fi
+
+    _step_init
+    _step_active "Fetching subscribed regions"
+
+    local regions_json
+    regions_json=$(_ch_fetch_regions)
+    local region_count
+    region_count=$(jq '.data | length' <<< "$regions_json" 2>/dev/null)
+    [[ -z "$region_count" || "$region_count" == "null" ]] && region_count=0
+
+    if [[ $region_count -eq 0 ]]; then
+        _step_complete "Regions(0)"
+        _step_finish
+        _CH_SCAN_RESULTS="[]"
+        return 1
+    fi
+
+    _step_complete "Regions(${region_count})"
+
+    # Build region list
+    local -a region_names=()
+    while IFS= read -r rname; do
+        region_names+=("$rname")
+    done < <(jq -r '.data[]."region-name"' <<< "$regions_json" 2>/dev/null)
+
+    # Kill step spinner before progress bar
+    _step_phase_end
+
+    # Scan each region in parallel with progress bar
+    local tmpdir
+    tmpdir=$(mktemp -d "${TEMP_DIR}/ch_scan.XXXXXXXX")
+    local start_time
+    start_time=$(date +%s)
+    local completed=0
+
+    local tenancy_id="${TENANCY_ID}"
+    local -a pids=()
+    local -a pid_regions=()
+    for region in "${region_names[@]}"; do
+        (
+            local count
+            count=$(_ch_fetch_region_hosts "$region" "$tenancy_id")
+            echo "$count" > "${tmpdir}/${region}"
+        ) &
+        pids+=($!)
+        pid_regions+=("$region")
+
+        # Throttle parallel requests
+        if [[ ${#pids[@]} -ge $OCI_MAX_PARALLEL ]]; then
+            wait "${pids[0]}" 2>/dev/null
+            pids=("${pids[@]:1}")
+            pid_regions=("${pid_regions[@]:1}")
+            completed=$((completed + 1))
+            _ch_progress_bar "$completed" "$region_count" "$start_time"
+        fi
+    done
+
+    # Wait for remaining with progress updates
+    for pid in "${pids[@]}"; do
+        wait "$pid" 2>/dev/null
+        completed=$((completed + 1))
+        _ch_progress_bar "$completed" "$region_count" "$start_time"
+    done
+
+    local elapsed=$(( $(date +%s) - start_time ))
+    printf "${CLEAR_LINE}"
+
+    # Build results JSON
+    local results="[]"
+    local total_hosts=0
+    local regions_with_hosts=0
+    for region in "${region_names[@]}"; do
+        local count=0
+        [[ -f "${tmpdir}/${region}" ]] && count=$(cat "${tmpdir}/${region}")
+        [[ -z "$count" || "$count" == "null" ]] && count=0
+        results=$(jq --arg r "$region" --argjson c "$count" \
+            '. += [{"region": $r, "count": $c}]' <<< "$results")
+        total_hosts=$((total_hosts + count))
+        [[ $count -gt 0 ]] && regions_with_hosts=$((regions_with_hosts + 1))
+    done
+
+    rm -rf "$tmpdir" 2>/dev/null
+
+    # Final summary line
+    _STEP_COMPLETED_TEXT=""
+    _step_complete "Regions(${region_count})"
+    _step_complete "Hosts(${total_hosts} in ${regions_with_hosts} regions)"
+    _step_complete "${elapsed}s"
+    _step_finish
+
+    # Cache the results
+    echo "$results" | _cache_write "$scan_cache"
+    _CH_SCAN_RESULTS="$results"
+}
+
+# Progress bar for region scanning
+_ch_progress_bar() {
+    local done_count="$1" total="$2" start_time="$3"
+    local bar_width=40
+    local pct=0
+    [[ $total -gt 0 ]] && pct=$(( (done_count * 100) / total ))
+    local filled=$(( (done_count * bar_width) / total ))
+    local empty=$(( bar_width - filled ))
+    local elapsed=$(( $(date +%s) - start_time ))
+
+    local bar=""
+    [[ $filled -gt 0 ]] && bar=$(printf '█%.0s' $(seq 1 "$filled"))
+    local remaining=""
+    [[ $empty -gt 0 ]] && remaining=$(printf '░%.0s' $(seq 1 "$empty"))
+
+    printf "${CLEAR_LINE}  ${CYAN}Scanning:${NC} [${GREEN}%s${GRAY}%s${NC}] %3d%% (%d/%d regions, %ds) " \
+        "$bar" "$remaining" "$pct" "$done_count" "$total" "$elapsed"
+}
+
+# Display the region summary table
+_ch_display_region_summary() {
+    local results="$1"
+
+    echo ""
+    _ui_section "Compute Host Distribution by Region"
+    echo ""
+
+    local total_regions
+    total_regions=$(jq 'length' <<< "$results")
+    local total_hosts
+    total_hosts=$(jq '[.[].count] | add // 0' <<< "$results")
+    local regions_with
+    regions_with=$(jq '[.[] | select(.count > 0)] | length' <<< "$results")
+
+    echo -e "  ${CYAN}Regions Scanned:${NC}  ${WHITE}${total_regions}${NC}    ${CYAN}With Hosts:${NC}  ${WHITE}${regions_with}${NC}    ${CYAN}Total Hosts:${NC}  ${WHITE}${total_hosts}${NC}"
+    echo ""
+
+    if [[ $regions_with -eq 0 ]]; then
+        echo -e "  ${GRAY}No compute hosts found in any subscribed region${NC}"
+        echo ""
+        return
+    fi
+
+    # Table header — only regions with hosts
+    _ui_table_header "    %-4s  %-28s  %8s" "#" "Region" "Hosts"
+    echo ""
+
+    local idx=0
+    while IFS='|' read -r region count; do
+        [[ $count -eq 0 ]] && continue
+        ((idx++))
+        printf "    ${YELLOW}%-4s${NC}  %-28s  ${GREEN}%8s${NC}\n" \
+            "$idx" "$region" "$count"
+    done < <(jq -r '.[] | "\(.region)|\(.count)"' <<< "$results")
+
+    echo ""
+    echo -e "  ${CYAN}Total:${NC} ${WHITE}${total_hosts} compute host(s)${NC} across ${WHITE}${regions_with}${NC} of ${WHITE}${total_regions}${NC} region(s)"
+    echo ""
+}
+
+# Display detailed hosts for a selected region
+_ch_display_region_hosts() {
+    local region="$1"
+
+    echo ""
+    _step_init
+    _step_active "Fetching compute hosts in ${region}"
+
+    local hosts_json
+    hosts_json=$(_oci_call "Compute Hosts (${region})" \
+        oci compute compute-host list \
+            --compartment-id "${TENANCY_ID}" \
+            --region "$region" \
+            --all --output json)
+
+    local host_count
+    host_count=$(_jq_count "$hosts_json" ".data.items")
+    _step_complete "Hosts(${host_count})"
+    _step_finish
+
+    if [[ $host_count -eq 0 ]]; then
+        echo -e "  ${GRAY}No compute hosts found in ${region}${NC}"
+        _ui_pause
+        return
+    fi
+
+    echo ""
+    _ui_section "Compute Hosts — ${region}"
+    echo ""
+
+    _ui_table_header "    %-4s  %-30s  %-12s  %-10s  %-20s  %-14s  %s" \
+        "#" "Name" "State" "Health" "Shape" "Fault Domain" "Has Impacted"
+    echo ""
+
+    local hidx=0
+    while IFS='|' read -r name state health shape fd impacted host_id; do
+        ((hidx++))
+
+        # Color coding for state
+        local state_color="$WHITE"
+        case "$state" in
+            ACTIVE|OCCUPIED) state_color="$GREEN" ;;
+            AVAILABLE)       state_color="$CYAN" ;;
+            INACTIVE|*)      state_color="$GRAY" ;;
+        esac
+
+        # Color coding for health
+        local health_color="$GREEN"
+        case "$health" in
+            HEALTHY)                    health_color="$GREEN" ;;
+            DEGRADED)                   health_color="$YELLOW" ;;
+            IMPAIRED|UNHEALTHY|FAILED)  health_color="$RED" ;;
+        esac
+
+        # Color for impacted
+        local imp_color="$GRAY"
+        local imp_text="No"
+        if [[ "$impacted" == "true" ]]; then
+            imp_color="$RED"
+            imp_text="Yes"
+        fi
+
+        # Shorten FD for display
+        local fd_short="${fd##*-}"
+        [[ "$fd_short" == "$fd" ]] && fd_short="$fd"
+
+        printf "    ${YELLOW}%-4s${NC}  %-30s  ${state_color}%-12s${NC}  ${health_color}%-10s${NC}  %-20s  %-14s  ${imp_color}%s${NC}\n" \
+            "$hidx" "$(truncate_string "${name:-N/A}" 30)" \
+            "${state:-N/A}" "${health:-N/A}" \
+            "$(truncate_string "${shape:-N/A}" 20)" \
+            "$fd_short" "$imp_text"
+    done < <(jq -r '.data.items[] | "\(.["display-name"] // "N/A")|\(.["lifecycle-state"] // "N/A")|\(.health // "N/A")|\(.shape // "N/A")|\(.["fault-domain"] // "N/A")|\(.["has-impacted-components"] // false)|\(.id)"' <<< "$hosts_json" 2>/dev/null)
+
+    echo ""
+
+    # Detail drill-down
+    local -a host_ids=()
+    while IFS= read -r hid; do
+        host_ids+=("$hid")
+    done < <(jq -r '.data.items[].id' <<< "$hosts_json" 2>/dev/null)
+
+    while true; do
+        echo -e "  ${CYAN}Enter host # for details, or ${YELLOW}b${CYAN} to go back${NC}"
+        _ui_prompt "Compute Hosts - ${region}" "#, b"
+        local hchoice
+        read -r hchoice
+
+        case "$hchoice" in
+            b|B|back) break ;;
+            "")       break ;;
+            *[!0-9]*) echo -e "  ${RED}Invalid selection${NC}"; continue ;;
+        esac
+
+        if [[ $hchoice -lt 1 || $hchoice -gt ${#host_ids[@]} ]]; then
+            echo -e "  ${RED}Selection out of range (1-${#host_ids[@]})${NC}"
+            continue
+        fi
+
+        local selected_id="${host_ids[$((hchoice-1))]}"
+        _ch_display_host_detail "$selected_id" "$region"
+    done
+}
+
+# Display detailed view of a single compute host
+_ch_display_host_detail() {
+    local host_id="$1"
+    local region="$2"
+
+    echo ""
+    _step_init
+    _step_active "Fetching host details"
+
+    local detail_json
+    detail_json=$(_oci_call "Host Detail" \
+        oci compute compute-host get \
+            --compute-host-id "$host_id" \
+            --region "$region" \
+            --output json)
+
+    _step_complete "Details"
+    _step_finish
+
+    if [[ -z "$detail_json" || "$detail_json" == "null" ]]; then
+        echo -e "  ${RED}Failed to fetch host details${NC}"
+        _ui_pause
+        return
+    fi
+
+    local data
+    data=$(jq '.data' <<< "$detail_json")
+
+    local name state health shape ad fd platform
+    local host_ocid instance_id cap_res_id hpc_island net_block local_block
+    local host_group gpu_fabric impacted created updated compartment
+
+    name=$(jq -r '.["display-name"] // "N/A"' <<< "$data")
+    state=$(jq -r '.["lifecycle-state"] // "N/A"' <<< "$data")
+    health=$(jq -r '.health // "N/A"' <<< "$data")
+    shape=$(jq -r '.shape // "N/A"' <<< "$data")
+    ad=$(jq -r '.["availability-domain"] // "N/A"' <<< "$data")
+    fd=$(jq -r '.["fault-domain"] // "N/A"' <<< "$data")
+    platform=$(jq -r '.platform // "N/A"' <<< "$data")
+    host_ocid=$(jq -r '.id // "N/A"' <<< "$data")
+    instance_id=$(jq -r '.["instance-id"] // "N/A"' <<< "$data")
+    cap_res_id=$(jq -r '.["capacity-reservation-id"] // "N/A"' <<< "$data")
+    hpc_island=$(jq -r '.["hpc-island-id"] // "N/A"' <<< "$data")
+    net_block=$(jq -r '.["network-block-id"] // "N/A"' <<< "$data")
+    local_block=$(jq -r '.["local-block-id"] // "N/A"' <<< "$data")
+    host_group=$(jq -r '.["compute-host-group-id"] // "N/A"' <<< "$data")
+    gpu_fabric=$(jq -r '.["gpu-memory-fabric-id"] // "N/A"' <<< "$data")
+    impacted=$(jq -r '.["has-impacted-components"] // "N/A"' <<< "$data")
+    created=$(jq -r '.["time-created"] // "N/A"' <<< "$data")
+    updated=$(jq -r '.["time-updated"] // "N/A"' <<< "$data")
+    compartment=$(jq -r '.["compartment-id"] // "N/A"' <<< "$data")
+
+    echo ""
+    _ui_detail_banner "Compute Host - ${name}"
+    echo ""
+
+    # Health color
+    local health_color="$GREEN"
+    case "$health" in
+        DEGRADED)                   health_color="$YELLOW" ;;
+        IMPAIRED|UNHEALTHY|FAILED)  health_color="$RED" ;;
+    esac
+
+    _ui_kv "Name"             "$name"
+    _ui_kv "State"            "$state"
+    _ui_kv "Health"           "${health}" "${health_color}"
+    _ui_kv "Shape"            "$shape"
+    _ui_kv "Platform"         "$platform"
+    _ui_kv "Region"           "$region"
+    _ui_kv "AD"               "$ad"
+    _ui_kv "Fault Domain"     "$fd"
+    echo ""
+    _ui_subheader "Instance & Reservation" 2
+    _ui_kv "Instance ID"      "$(_short_ocid "$instance_id")"
+    _ui_kv "Cap Reservation"  "$(_short_ocid "$cap_res_id")"
+    _ui_kv "Host Group"       "$(_short_ocid "$host_group")"
+    echo ""
+    _ui_subheader "Topology" 2
+    _ui_kv "HPC Island"       "$(_short_ocid "$hpc_island")"
+    _ui_kv "Network Block"    "$(_short_ocid "$net_block")"
+    _ui_kv "Local Block"      "$(_short_ocid "$local_block")"
+    _ui_kv "GPU Fabric"       "$(_short_ocid "$gpu_fabric")"
+    echo ""
+    _ui_subheader "Maintenance" 2
+    local imp_color="$GREEN" imp_text="No"
+    if [[ "$impacted" == "true" ]]; then
+        imp_color="$RED"
+        imp_text="Yes"
+
+        # Show impacted component details if available
+        local imp_details
+        imp_details=$(jq -r '.["impacted-component-details"] // empty' <<< "$data" 2>/dev/null)
+        if [[ -n "$imp_details" && "$imp_details" != "null" ]]; then
+            _ui_kv "Impacted" "$imp_text" "$imp_color"
+            echo ""
+            echo -e "    ${YELLOW}Impacted Components:${NC}"
+            jq -r '
+                if .impactedComponents then
+                    .impactedComponents | to_entries[] |
+                    "      \(.key): \(.value | if type == "array" then (. | join(", ")) elif type == "object" then (. | tostring) else . end)"
+                else
+                    "      (no details available)"
+                end
+            ' <<< "$imp_details" 2>/dev/null
+        else
+            _ui_kv "Impacted" "$imp_text" "$imp_color"
+        fi
+    else
+        _ui_kv "Impacted" "$imp_text" "$imp_color"
+    fi
+
+    # Recycle details
+    local recycle_level
+    recycle_level=$(jq -r '.["recycle-details"]["recycle-level"] // "N/A"' <<< "$data" 2>/dev/null)
+    [[ "$recycle_level" != "N/A" && "$recycle_level" != "null" ]] && \
+        _ui_kv "Recycle Level" "$recycle_level"
+
+    echo ""
+    _ui_subheader "Timestamps" 2
+    _ui_kv "Created"          "$created"
+    _ui_kv "Updated"          "$updated"
+    echo ""
+    _ui_kv "Host OCID"        "$host_ocid" "$GRAY"
+    _ui_kv "Compartment"      "$(_short_ocid "$compartment")" "$GRAY"
+    echo ""
+
+    _ui_pause
+}
+
+# Main compute hosts menu
+_menu_compute_hosts() {
+    _CH_SCAN_RESULTS=""
+
+    while true; do
+        _ui_menu_header "COMPUTE HOSTS — Multi-Region Scan" \
+            --breadcrumb "Compute Hosts" \
+            --color "$BLUE" \
+            --env \
+            --cmd "oci compute compute-host list --compartment-id \$TENANCY_ID --region <region>"
+
+        echo ""
+        _ui_actions
+        _ui_action_group "Actions"
+        echo -e "  ${YELLOW}1${NC})  ${WHITE}Scan All Regions${NC}     - Discover compute hosts across all subscribed regions"
+        echo -e "  ${YELLOW}2${NC})  ${WHITE}View Region Hosts${NC}    - View hosts in a specific region"
+        echo -e "  ${YELLOW}r${NC})  ${WHITE}Refresh${NC}              - Force rescan (ignore cache)"
+        echo ""
+        echo -e "  ${RED}b${NC})  ${WHITE}Back${NC}"
+        echo ""
+        _ui_prompt "Compute Hosts" "1, 2, r, b"
+        local choice
+        read -r choice
+
+        case "$choice" in
+            1)
+                _ch_scan_all_regions false
+                if [[ -n "$_CH_SCAN_RESULTS" && "$_CH_SCAN_RESULTS" != "[]" ]]; then
+                    _ch_display_region_summary "$_CH_SCAN_RESULTS"
+                    _ui_pause
+                else
+                    echo -e "  ${RED}No subscribed regions found or scan failed${NC}"
+                    _ui_pause
+                fi
+                ;;
+            2)
+                # If we haven't scanned yet, scan first
+                if [[ -z "$_CH_SCAN_RESULTS" || "$_CH_SCAN_RESULTS" == "[]" ]]; then
+                    _ch_scan_all_regions false
+                fi
+                if [[ -z "$_CH_SCAN_RESULTS" || "$_CH_SCAN_RESULTS" == "[]" ]]; then
+                    echo -e "  ${RED}No regions available. Run scan first.${NC}"
+                    _ui_pause
+                    continue
+                fi
+
+                # Show summary (only regions with hosts) and let user pick
+                _ch_display_region_summary "$_CH_SCAN_RESULTS"
+
+                # Build filtered list (only regions with count > 0)
+                local filtered_regions
+                filtered_regions=$(jq '[.[] | select(.count > 0)]' <<< "$_CH_SCAN_RESULTS")
+                local filtered_count
+                filtered_count=$(jq 'length' <<< "$filtered_regions")
+
+                if [[ $filtered_count -eq 0 ]]; then
+                    echo -e "  ${GRAY}No regions with compute hosts found${NC}"
+                    _ui_pause
+                    continue
+                fi
+
+                echo -e "  ${CYAN}Enter region # to view hosts, or ${YELLOW}b${CYAN} to go back${NC}"
+                _ui_prompt "Select Region" "#, b"
+                local rchoice
+                read -r rchoice
+
+                case "$rchoice" in
+                    b|B|back|"") continue ;;
+                    *[!0-9]*) echo -e "  ${RED}Invalid selection${NC}"; _ui_pause; continue ;;
+                esac
+
+                if [[ $rchoice -lt 1 || $rchoice -gt $filtered_count ]]; then
+                    echo -e "  ${RED}Selection out of range (1-${filtered_count})${NC}"
+                    _ui_pause
+                    continue
+                fi
+
+                local selected_region
+                selected_region=$(jq -r ".[$((rchoice-1))].region" <<< "$filtered_regions")
+
+                _ch_display_region_hosts "$selected_region"
+                ;;
+            r|R|refresh)
+                _ch_scan_all_regions true
+                if [[ -n "$_CH_SCAN_RESULTS" && "$_CH_SCAN_RESULTS" != "[]" ]]; then
+                    _ch_display_region_summary "$_CH_SCAN_RESULTS"
+                    _ui_pause
+                else
+                    echo -e "  ${RED}Scan failed or no regions found${NC}"
+                    _ui_pause
+                fi
+                ;;
+            b|B|back)
+                return
+                ;;
+            show|SHOW) continue ;;
+            "")  return ;;
+            *)   echo -e "  ${RED}Invalid selection. Enter 1, 2, r, or b.${NC}" ;;
+        esac
+    done
+}
+
+#===============================================================================
 # MAIN MENU
 #===============================================================================
 
@@ -5406,6 +5939,7 @@ interactive_main_menu() {
             echo -e "  ${YELLOW}t${NC})  ${WHITE}OKE Testing${NC}       - Node creation, health checks, NCCL tests"
             echo -e "  ${YELLOW}i${NC})  ${WHITE}Images${NC}            - Import, create, and manage custom images"
             echo -e "  ${YELLOW}m${NC})  ${WHITE}Metadata${NC}          - Browse instance metadata service (IMDS)"
+            echo -e "  ${YELLOW}h${NC})  ${WHITE}Compute Hosts${NC}     - Multi-region compute host scan & details"
             echo ""
             _ui_action_group "Utilities"
             echo -e "  ${CYAN}env${NC})   ${WHITE}Change Focus${NC}    - Change region, compartment, OKE cluster"
@@ -5414,7 +5948,7 @@ interactive_main_menu() {
             echo -e "  ${GRAY}Shortcuts: p1=OKE Stack, p2=Slurm 2.x, p3=Slurm 3.x${NC}"
             echo -e "  ${GRAY}Quick env: env c (compartment), env r (region), env oke${NC}"
             echo ""
-            _ui_prompt "GPU Ops" "p, t, i, m, env, q"
+            _ui_prompt "GPU Ops" "p, t, i, m, h, env, q"
             
             read -r choice
         fi
@@ -5423,7 +5957,7 @@ interactive_main_menu() {
         
         # Parse shortcuts: p1, p2, t3, etc.
         local category="" item=""
-        if [[ "$choice" =~ ^([ptimPTIM])([0-9]+)?$ ]]; then
+        if [[ "$choice" =~ ^([ptimhPTIMH])([0-9]+)?$ ]]; then
             category="${BASH_REMATCH[1],,}"
             item="${BASH_REMATCH[2]}"
         fi
@@ -5433,6 +5967,7 @@ interactive_main_menu() {
             t) _menu_oke_testing "$item" ;;
             i) _menu_images ;;
             m) _menu_metadata ;;
+            h) _menu_compute_hosts ;;
             env*|ENV*) _env_dispatch "$choice" ;;
             q|Q|quit|QUIT|exit|EXIT)
                 echo ""
@@ -5440,7 +5975,7 @@ interactive_main_menu() {
                 break
                 ;;
             show|SHOW) continue ;;
-            *) echo -e "${RED}Invalid selection. Enter p, t, i, m, env, or q.${NC}" ;;
+            *) echo -e "${RED}Invalid selection. Enter p, t, i, m, h, env, or q.${NC}" ;;
         esac
     done
 }
@@ -5469,6 +6004,7 @@ ${BOLD}MENU CATEGORIES:${NC}
   t) OKE Testing        Node creation, health checks, NCCL templates
   i) Images             Custom image import, create, management
   m) Metadata           Instance Metadata Service (IMDS) browser
+  h) Compute Hosts      Multi-region compute host scan & details
 
 ${BOLD}SHORTCUTS:${NC}
   p1  OKE Stack POC         p2  Slurm 2.x POC      p3  Slurm 3.x POC
