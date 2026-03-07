@@ -1,6 +1,6 @@
 **GPU Operational Testing** — Interactive tool for GPU operational testing, POC stack deployments, OKE node management, custom image operations, and instance metadata inspection on Oracle Cloud Infrastructure.
 
-**Version:** 1.0 | **Lines:** ~6,200
+**Version:** 1.0 | **Lines:** ~6,200 | **Date:** 2026-03-06
 
 ## Overview
 
@@ -45,6 +45,7 @@ Scan all subscribed regions in parallel to discover compute hosts, view distribu
 ./gpu_ops_testing.sh --manage p1    # OKE Stack POC
 ./gpu_ops_testing.sh --manage t1    # Add Node (Config)
 ./gpu_ops_testing.sh --manage i     # Images
+./gpu_ops_testing.sh --manage h     # Compute Hosts
 
 # Enable debug output
 ./gpu_ops_testing.sh --debug --manage
@@ -145,13 +146,15 @@ Actions: `#` (detail view), `gpu` (add GPU shape compatibility), `import` (impor
 
 | Option | Function | Description |
 |--------|----------|-------------|
-| `1` | Scan All Regions | Parallel scan of all subscribed regions for compute hosts |
+| `1` | Scan All Regions | Parallel scan of all subscribed regions with progress bar |
 | `2` | View Region Hosts | Select a region to list hosts with state, health, shape, topology |
 | `r` | Refresh | Force rescan ignoring cache |
 
+Summary table displays only regions with active compute hosts (count > 0), showing total distribution across the tenancy.
+
 **Host Detail View** (`#` drill-down): Name, state, health, shape, platform, AD/FD, instance ID, capacity reservation, HPC island/network block/local block topology, GPU memory fabric, impacted components, recycle status, timestamps.
 
-Scan results are cached for 10 minutes. Regions are queried in parallel (up to `OCI_MAX_PARALLEL` concurrent calls).
+Scan results are cached for 10 minutes. Regions are queried in parallel (up to `OCI_MAX_PARALLEL` concurrent calls) with a live progress bar showing completion percentage and elapsed time.
 
 ---
 
