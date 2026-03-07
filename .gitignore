@@ -2,3 +2,5 @@ variables.sh
 cache/
 logs/
 *.tmp
+CLAUDE.md
+.claude/
